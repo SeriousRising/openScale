@@ -17,13 +17,16 @@
  */
 package com.health.openscale.core.facade
 
+import android.Manifest
 import android.app.Application
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.content.pm.PackageManager
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.core.content.ContextCompat
 import com.health.openscale.core.bluetooth.BluetoothEvent
 import com.health.openscale.core.bluetooth.ScaleFactory
 import com.health.openscale.core.bluetooth.data.ScaleUser
@@ -247,7 +250,14 @@ class BluetoothFacadeImpl @Inject constructor(
         }
     }
 
-    override fun attemptAutoConnectToSavedDevice() = connectToSavedDevice()
+    override fun attemptAutoConnectToSavedDevice() {
+        // Automatic attempts must not trigger permission or radio-enable prompts.
+        if (ContextCompat.checkSelfPermission(application, Manifest.permission.BLUETOOTH_SCAN) !=
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(application, Manifest.permission.BLUETOOTH_CONNECT) !=
+            PackageManager.PERMISSION_GRANTED || !isBluetoothEnabled()) return
+        connectToSavedDevice()
+    }
 
     override fun disconnect() = connection.disconnect()
 

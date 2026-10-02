@@ -19,23 +19,27 @@ package com.health.openscale.ui.screen.settings
 
 import android.content.Context
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.health.openscale.R
 import com.health.openscale.core.bluetooth.BluetoothEvent
 import com.health.openscale.core.bluetooth.scales.TuningProfile
+import com.health.openscale.core.data.ConnectionStatus
 import com.health.openscale.core.facade.SettingsFacadeImpl
 import com.health.openscale.core.service.ScannedDeviceInfo
 import com.health.openscale.testutil.FakeBluetoothFacade
 import com.health.openscale.testutil.MainDispatcherRule
 import com.health.openscale.ui.shared.SnackbarEvent
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
@@ -56,15 +60,17 @@ class BluetoothViewModelTest {
     private val context: Context get() = ApplicationProvider.getApplicationContext()
     private lateinit var fake: FakeBluetoothFacade
     private lateinit var vm: BluetoothViewModel
+    private lateinit var settings: SettingsFacadeImpl
 
     @Before
     fun setUp() {
         fake = FakeBluetoothFacade()
         val dataStore = PreferenceDataStoreFactory.create(
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            scope = CoroutineScope(SupervisorJob() + mainRule.dispatcher),
             produceFile = { File(context.cacheDir, "btvm-${System.nanoTime()}.preferences_pb") },
         )
-        vm = BluetoothViewModel(fake, SettingsFacadeImpl(dataStore))
+        settings = SettingsFacadeImpl(dataStore)
+        vm = BluetoothViewModel(fake, settings)
     }
 
     @After
@@ -74,6 +80,92 @@ class BluetoothViewModelTest {
 
     private fun device(addr: String = "AA:BB:CC:DD:EE:FF") =
         ScannedDeviceInfo(name = "Dev", address = addr, rssi = -50, serviceUuids = emptyList(), manufacturerData = null)
+
+    private class ForegroundOwner : LifecycleOwner {
+        override val lifecycle = LifecycleRegistry(this)
+        init { lifecycle.currentState = Lifecycle.State.CREATED }
+    }
+
+    @Test
+    fun autoConnect_rearmsWhenSameViewModelReturnsToForeground() = runTest(mainRule.dispatcher.scheduler) {
+        settings.setAutoConnectOnStartup(true)
+        fake.savedDevice.value = device()
+        val owner = ForegroundOwner()
+        backgroundScope.launch { vm.observeForegroundAutoConnect(owner.lifecycle) }
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(0)
+
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        advanceUntilIdle()
+        assertThat(fake.autoConnectAttempts).isEqualTo(1)
+
+        fake.connectionStatus.value = ConnectionStatus.CONNECTED
+        fake.connectionStatus.value = ConnectionStatus.DISCONNECTED
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(1)
+        owner.lifecycle.currentState = Lifecycle.State.CREATED
+        runCurrent()
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        advanceUntilIdle()
+        assertThat(fake.autoConnectAttempts).isEqualTo(2)
+    }
+
+    @Test
+    fun autoConnect_respectsDisabledPreferenceAndActiveConnections() = runTest(mainRule.dispatcher.scheduler) {
+        fake.savedDevice.value = device()
+        val owner = ForegroundOwner()
+        backgroundScope.launch { vm.observeForegroundAutoConnect(owner.lifecycle) }
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(0)
+
+        settings.setAutoConnectOnStartup(true)
+        for (status in listOf(ConnectionStatus.CONNECTED, ConnectionStatus.CONNECTING,
+            ConnectionStatus.DISCONNECTING, ConnectionStatus.BROADCAST_LISTENING)) {
+            owner.lifecycle.currentState = Lifecycle.State.CREATED
+            runCurrent()
+            fake.connectionStatus.value = status
+            owner.lifecycle.currentState = Lifecycle.State.STARTED
+            runCurrent()
+            assertThat(fake.autoConnectAttempts).isEqualTo(0)
+        }
+    }
+
+    @Test
+    fun autoConnect_cancelsPendingDeviceWaitInBackground() = runTest(mainRule.dispatcher.scheduler) {
+        settings.setAutoConnectOnStartup(true)
+        val owner = ForegroundOwner()
+        backgroundScope.launch { vm.observeForegroundAutoConnect(owner.lifecycle) }
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        assertThat(fake.savedDevice.subscriptionCount.value).isEqualTo(1)
+
+        owner.lifecycle.currentState = Lifecycle.State.CREATED
+        runCurrent()
+        assertThat(fake.savedDevice.subscriptionCount.value).isEqualTo(0)
+        fake.savedDevice.value = device()
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(0)
+
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(1)
+    }
+
+    @Test
+    fun autoConnect_rechecksPreferenceAfterWaitingForDevice() = runTest(mainRule.dispatcher.scheduler) {
+        settings.setAutoConnectOnStartup(true)
+        val owner = ForegroundOwner()
+        backgroundScope.launch { vm.observeForegroundAutoConnect(owner.lifecycle) }
+        owner.lifecycle.currentState = Lifecycle.State.STARTED
+        runCurrent()
+        settings.setAutoConnectOnStartup(false)
+        fake.savedDevice.value = device()
+        runCurrent()
+        assertThat(fake.autoConnectAttempts).isEqualTo(0)
+    }
 
     // ---- scan gate --------------------------------------------------------------------------
 

@@ -298,6 +298,15 @@ class BleConnector(
                 }
             }
 
+            is BluetoothEvent.Reconnecting -> {
+                if (_connectedDeviceAddress.value == event.deviceAddress &&
+                    (_connectionStatus.value == ConnectionStatus.CONNECTED ||
+                        _connectionStatus.value == ConnectionStatus.CONNECTING)) {
+                    _connectionStatus.value = ConnectionStatus.CONNECTING
+                    _connectionError.value = null
+                }
+            }
+
             is BluetoothEvent.Connected -> {
                 LogManager.i(TAG, "Event: Connected to ${event.deviceName} (${event.deviceAddress})")
                 disconnectTimeoutJob?.cancel()
@@ -530,6 +539,7 @@ class BleConnector(
 
             try {
                 val measurementId = measurementFacade.saveMeasurementFromBleDevice(newDbMeasurement, values)
+                    ?: return@launch
                 LogManager.i(
                     TAG,
                     "Measurement from $deviceName for User $currentAppUserId saved (ID: $measurementId). Values: ${values.size}"

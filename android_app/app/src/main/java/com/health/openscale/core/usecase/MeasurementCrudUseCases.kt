@@ -27,6 +27,7 @@ import com.health.openscale.core.data.Measurement
 import com.health.openscale.core.data.MeasurementValue
 import com.health.openscale.core.database.DatabaseRepository
 import com.health.openscale.core.facade.SettingsFacade
+import com.health.openscale.core.utils.LogManager
 import com.health.openscale.ui.widget.MeasurementWidget
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
@@ -64,7 +65,8 @@ class MeasurementCrudUseCases @Inject constructor(
      *
      * @return [Result.success] with the final measurement id (new or existing) on success,
      * [Result.success] with `-1` if the (userId, timestamp) slot is already taken (duplicate),
-     * or [Result.failure] on an unexpected error.
+     * or [Result.failure] on an error while saving. Post-save notification failures are logged
+     * without changing the persisted result.
      */
     suspend fun saveMeasurement(
         measurement: Measurement,
@@ -87,13 +89,18 @@ class MeasurementCrudUseCases @Inject constructor(
                 databaseRepository.insertMeasurementValue(v.copy(measurementId = newId))
             }
 
-            sync.triggerSyncInsert(measurementWithId, finalValues,"com.health.openscale.sync")
-            sync.triggerSyncInsert(measurementWithId, finalValues,"com.health.openscale.sync.oss")
-            sync.triggerSyncInsert(measurementWithId, finalValues,"com.health.openscale.sync.debug")
-
-            MeasurementWidget.refreshAll(appContext)
-
-            maybeVibrateOnMeasurement()
+            // Persistence is complete; optional effects must not turn it into a failed save.
+            listOf("com.health.openscale.sync", "com.health.openscale.sync.oss", "com.health.openscale.sync.debug").forEach { pkg ->
+                sync.triggerSyncInsert(measurementWithId, finalValues, pkg).onFailure {
+                    LogManager.e("MeasurementCrud", "Measurement saved but sync notification failed for $pkg", it)
+                }
+            }
+            runCatching { MeasurementWidget.refreshAll(appContext) }.onFailure {
+                LogManager.e("MeasurementCrud", "Measurement saved but widget refresh failed", it)
+            }
+            runCatching { maybeVibrateOnMeasurement() }.onFailure {
+                LogManager.e("MeasurementCrud", "Measurement saved but vibration failed", it)
+            }
 
             newId
         } else {
@@ -138,13 +145,19 @@ class MeasurementCrudUseCases @Inject constructor(
             // raw values were cleared, so the loop above triggered no recalculation).
             databaseRepository.recalculateDerivedValuesForMeasurement(measurement.id)
 
-            deleteImageFiles(appContext, previousImages - imageFileNames(finalValues))
-
-            sync.triggerSyncUpdate(measurement, finalValues, "com.health.openscale.sync")
-            sync.triggerSyncUpdate(measurement, finalValues,"com.health.openscale.sync.oss")
-            sync.triggerSyncUpdate(measurement, finalValues,"com.health.openscale.sync.debug")
-
-            MeasurementWidget.refreshAll(appContext)
+            runCatching {
+                deleteImageFiles(appContext, previousImages - imageFileNames(finalValues))
+            }.onFailure {
+                LogManager.e("MeasurementCrud", "Measurement saved but old image cleanup failed", it)
+            }
+            listOf("com.health.openscale.sync", "com.health.openscale.sync.oss", "com.health.openscale.sync.debug").forEach { pkg ->
+                sync.triggerSyncUpdate(measurement, finalValues, pkg).onFailure {
+                    LogManager.e("MeasurementCrud", "Measurement saved but sync notification failed for $pkg", it)
+                }
+            }
+            runCatching { MeasurementWidget.refreshAll(appContext) }.onFailure {
+                LogManager.e("MeasurementCrud", "Measurement saved but widget refresh failed", it)
+            }
 
             measurement.id
         }

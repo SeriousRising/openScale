@@ -140,6 +140,10 @@ fun AppNavigation(sharedViewModel: SharedViewModel) {
 
     val bluetoothViewModel: BluetoothViewModel = hiltViewModel()
 
+    LaunchedEffect(lifecycleOwner, bluetoothViewModel) {
+        bluetoothViewModel.observeForegroundAutoConnect(lifecycleOwner.lifecycle)
+    }
+
     // Observe the current navigation route
     val currentBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = currentBackStackEntry?.destination?.route

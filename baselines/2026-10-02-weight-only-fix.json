@@ -1,0 +1,14 @@
+{
+  "base_commit": "9fea9c813de282a0c3ab54bca923e62ee2d0362e",
+  "state": "uncommitted foreground rearm + ESF551 final packet fix",
+  "command": "./gradlew testDebugUnitTest lintDebug compileDebugAndroidTestKotlin assembleDebug",
+  "result": "PASS",
+  "tests": 887,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "lint": "PASS",
+  "instrumented_test_compile": "PASS",
+  "debug_apk": "INSTALLED_WITH_APPROVAL",
+  "physical_validation": "PENDING"
+}

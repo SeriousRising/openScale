@@ -41,6 +41,9 @@ import com.health.openscale.core.facade.UserFacade
 import com.health.openscale.core.model.MeasurementWithValues
 import com.health.openscale.core.utils.ConverterUtils
 import com.health.openscale.core.utils.LogManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -255,18 +258,21 @@ abstract class ModernScaleAdapter(
     protected val settingsFacade: SettingsFacade,
     protected val measurementFacade: MeasurementFacade,
     protected val userFacade: UserFacade,
-    protected val handler: ScaleDeviceHandler
+    protected val handler: ScaleDeviceHandler,
+    dispatcher: CoroutineDispatcher = Dispatchers.Default
 ) : ScaleCommunicator, AutoCloseable {
 
     protected val TAG = this::class.simpleName ?: "ModernScaleAdapter"
 
     // ---- coroutine & lifecycle -----------------------------------------------------------------
-    protected val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    protected val scope = CoroutineScope(dispatcher + SupervisorJob())
     protected val mainHandler = Handler(Looper.getMainLooper())
 
     // ---- session targeting ---------------------------------------------------------------------
     protected var targetAddress: String? = null
     protected var lastDisconnectAtMs: Long = 0L
+    @Volatile protected var measurementPublished = false
+    private var connectJob: Job? = null
 
     // ---- UI streams ----------------------------------------------------------------------------
     val _events = MutableSharedFlow<BluetoothEvent>(replay = 1, extraBufferCapacity = 8)
@@ -329,7 +335,9 @@ abstract class ModernScaleAdapter(
         targetAddress = address
         _isConnecting.value = true
 
-        scope.launch {
+        connectJob?.cancel()
+        measurementPublished = false
+        connectJob = scope.launch {
             val user: ScaleUser? =
                 scaleUser
                     ?: selectedUserSnapshot
@@ -351,6 +359,7 @@ abstract class ModernScaleAdapter(
             runCatching {
                 doConnect(address, user)
             }.onFailure { t ->
+                if (t is CancellationException) throw t
                 _events.tryEmit(
                     BluetoothEvent.ConnectionFailed(
                         address,
@@ -366,6 +375,7 @@ abstract class ModernScaleAdapter(
      * Template method: calls [doDisconnect] and resets shared state.
      */
     final override fun disconnect() {
+        connectJob?.cancel()
         doDisconnect()
         cleanup()
     }
@@ -414,6 +424,7 @@ abstract class ModernScaleAdapter(
 
     protected val appCallbacks = object : ScaleDeviceHandler.Callbacks {
         override fun onPublish(measurement: ScaleMeasurement) {
+            measurementPublished = true
             val addr = targetAddress ?: "unknown"
             _events.tryEmit(BluetoothEvent.MeasurementReceived(measurement, addr))
         }

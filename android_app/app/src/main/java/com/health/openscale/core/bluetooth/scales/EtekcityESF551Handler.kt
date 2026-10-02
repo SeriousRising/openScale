@@ -48,6 +48,8 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
         private val SW_REVISION_STRING_CHARACTERISTIC = UUID.fromString("00002a28-0000-1000-8000-00805f9b34fb")
     }
 
+    private var publishedThisSession = false
+
     override fun supportFor(device: ScannedDeviceInfo): DeviceSupport? {
         if (!device.name.startsWith("Etekcity Smart Fitness Scale", ignoreCase = true)) {
             return null
@@ -70,6 +72,7 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
     }
 
     override fun onConnected(user: ScaleUser) {
+        publishedThisSession = false
         logI("ESF-551 connected, starting setup sequence")
 
         setUnit(user.scaleUnit)
@@ -85,11 +88,12 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
     }
 
     override fun onNotification(characteristic: UUID, data: ByteArray, user: ScaleUser) {
-        if (data.isEmpty()) return
+        if (data.isEmpty() || publishedThisSession) return
 
         if (characteristic == WEIGHT_CHARACTERISTIC_NOTIFY) {
             val measurement = parsePayload(data, user)
             if (measurement != null) {
+                publishedThisSession = true
                 publish(measurement)
                 requestDisconnect()
             }
@@ -114,6 +118,9 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
             return null
         }
 
+        // Byte 19 marks the final reading; byte 20 only marks impedance validity.
+        if (data[19] != 1.toByte()) return null
+
         val weightRaw = data[10].toUByte().toUInt() or
                 data[11].toUByte().toUInt().shl(8) or
                 data[12].toUByte().toUInt().shl(16)
@@ -125,10 +132,10 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
             dateTime = Date(),
         ).also { m ->
             m[MeasurementType.WEIGHT] = Kg(weightKg.toFloat())
-            m[MeasurementType.IMPEDANCE] = Ohm(impedance.toFloat())
         }
 
-        if (impedance > 0 && impedance < 1500) {
+        if (data[20] == 1.toByte() && impedance > 0 && impedance < 1500) {
+            measurement[MeasurementType.IMPEDANCE] = Ohm(impedance.toFloat())
             val lib = StandardImpedanceLib(
                 gender = user.gender,
                 age = user.age,
@@ -143,12 +150,8 @@ class EtekcityESF551Handler : ScaleDeviceHandler() {
             measurement[MeasurementType.BMR] = Kcal(lib.basalMetabolicRate.toFloat())
         }
 
-        if (data[20] == 1.toByte() && impedance > 0) {
-            logD("Final measurement: $measurement")
-            return measurement
-        }
-
-        return null
+        logD("Final measurement: $measurement")
+        return measurement
     }
 
     private fun setUnit(unit: WeightUnit) {

@@ -51,6 +51,7 @@ class FakeBluetoothFacade : BluetoothFacade {
     var stopScanCalled = false
     var connectCalled = false
     var autoConnectCalled = false
+    var autoConnectAttempts = 0
     var disconnectCalled = false
     var savedAsPreferred: ScannedDeviceInfo? = null
     var removeSavedDeviceCalled = false
@@ -63,7 +64,7 @@ class FakeBluetoothFacade : BluetoothFacade {
     override fun startScan(durationMs: Long) { startScanDurationMs = durationMs; isScanning.value = true }
     override fun stopScan() { stopScanCalled = true; isScanning.value = false }
     override fun connectToSavedDevice() { connectCalled = true }
-    override fun attemptAutoConnectToSavedDevice() { autoConnectCalled = true }
+    override fun attemptAutoConnectToSavedDevice() { autoConnectCalled = true; autoConnectAttempts++ }
     override fun disconnect() { disconnectCalled = true }
     override fun saveAsPreferred(device: ScannedDeviceInfo) { savedAsPreferred = device }
     override fun removeSavedDevice() { removeSavedDeviceCalled = true }

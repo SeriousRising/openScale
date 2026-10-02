@@ -1,0 +1,34 @@
+{
+  "date": "2026-10-02",
+  "base_commit": "9fea9c813de282a0c3ab54bca923e62ee2d0362e",
+  "tracked_diff_sha256": "855c907b52a9f679cec470b544fb2821bc6d9425ca2ba97e7578e1c04421c7dc",
+  "checks": {
+    "tests": 907,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "lint": "passed",
+  "instrumented_test_compilation": "passed",
+  "apk_assembly": "passed",
+  "deployment": "fork retained as sole scale app; original removed after verified backup and data comparison",
+  "new_followup_test_files": [
+    "MeasurementFacadeBleSaveTest.kt",
+    "GattScaleAdapterTest.kt"
+  ],
+  "prior_installed_test_count": 887,
+  "hardware_acceptance": {
+    "weight_only_save": "owner confirmed and database verified",
+    "remote_idle_disconnect": "automatic retry and rescan observed",
+    "second_reading_without_bluetooth_tap": "owner confirmed and database verified",
+    "stale_composition": "absent in both new stored records",
+    "production_sync": "debug records ignored",
+    "physical_calibration": "not tested"
+  },
+  "sole_app_migration": {
+    "original_data": "all original user/goals/measurement/type/value rows preserved in fork",
+    "original_package": "removed with owner authorization",
+    "sync_source": "com.health.openscale.debug",
+    "health_connect": "connection test and full export passed"
+  }
+}

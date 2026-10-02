@@ -119,6 +119,45 @@ class MeasurementValueInheritanceTest {
         firstOrNull { it.typeId == typeId }?.floatValue
 
     @Test
+    fun inherits_doesNotCopyCompositionOrDeviceReadingsButKeepsManualValues() = runBlocking {
+        val compositionKeys = setOf(
+            MeasurementType.BODY_FAT, MeasurementType.WATER, MeasurementType.MUSCLE,
+            MeasurementType.BONE, MeasurementType.LBM, MeasurementType.VISCERAL_FAT,
+            MeasurementType.PROTEIN,
+        )
+        val compositionIds = repo.getAllMeasurementTypes().first()
+            .filter { it.key in compositionKeys }.map { it.id }
+        assertThat(compositionIds).hasSize(compositionKeys.size)
+        val deviceId = repo.insertMeasurementType(
+            MeasurementType(identity = "ble.test.segmental_fat", name = "Device fat",
+                inputType = InputFieldType.FLOAT, unit = UnitType.PERCENT)
+        ).toInt()
+        insertHistory(1_000L, *(
+            compositionIds.map { float(it, 20f) } +
+                listOf(float(deviceId, 25f), float(waistId, 90f), float(weightId, 70f))
+            ).toTypedArray())
+
+        val result = transformation.applyValueInheritance(
+            incoming(2_000L), listOf(float(weightId, 71f))
+        )
+        assertThat(result.map { it.typeId }).containsExactly(weightId, waistId)
+        assertThat(result.floatOf(waistId)).isEqualTo(90f)
+
+        // The manual entry form shares this policy, so it cannot silently save old composition either.
+        val prefilled = transformation.applyValueInheritance(incoming(2_000L), emptyList())
+        assertThat(prefilled.map { it.typeId }).containsExactly(weightId, waistId)
+
+        // A fresh value supplied by the scale always wins.
+        val fatId = repo.getAllMeasurementTypes().first().first { it.key == MeasurementType.BODY_FAT }.id
+        val fresh = transformation.applyValueInheritance(
+            incoming(2_000L), listOf(float(weightId, 71f), float(fatId, 18f))
+        )
+        assertThat(fresh.floatOf(fatId)).isEqualTo(18f)
+        assertThat(fresh.map { it.typeId }).containsExactly(weightId, fatId, waistId)
+        Unit
+    }
+
+    @Test
     fun inherits_fillsNumericTypesTheScaleDoesNotReport() = runBlocking {
         insertHistory(
             1_000L,

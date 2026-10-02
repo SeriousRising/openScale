@@ -381,8 +381,8 @@ class MeasurementTransformationUseCase @Inject constructor(
      * - TEXT, DATE, TIME and USER are dropped: a comment or a date is written about *that* one
      *   weigh-in and would be wrong on the next.
      * - Derived types (BMI, BMR, …) are dropped — they are recomputed from the raw values.
-     * - Internal (impedance) and disabled types are dropped: raw device input, stale the moment it
-     *   is copied.
+     * - Body composition, device-owned, internal (impedance), and disabled types are dropped:
+     *   missing sensor values must not become fresh readings by copying history.
      *
      * The weight needs no special case: every scale reports one, so on the sync path it is already
      * in [values] and is left alone. Only the form pre-fill passes an empty [values] and therefore
@@ -405,10 +405,16 @@ class MeasurementTransformationUseCase @Inject constructor(
 
         val presentTypeIds = values.map { it.typeId }.toSet()
 
+        val compositionKeys = setOf(
+            MeasurementType.BODY_FAT, MeasurementType.WATER, MeasurementType.MUSCLE,
+            MeasurementType.BONE, MeasurementType.LBM, MeasurementType.VISCERAL_FAT,
+            MeasurementType.PROTEIN,
+        )
         val carried = previous.values.mapNotNull { previousValue ->
             val type = previousValue.type
             if (type.id in presentTypeIds) return@mapNotNull null
             if (type.isDerived || type.isInternal || !type.isEnabled) return@mapNotNull null
+            if (type.isDeviceOwned() || type.key in compositionKeys) return@mapNotNull null
 
             when (type.inputType) {
                 InputFieldType.FLOAT -> previousValue.value.floatValue

@@ -18,6 +18,8 @@
 package com.health.openscale.core.usecase
 
 import android.app.Application
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import com.health.openscale.core.data.ActivityLevel
@@ -29,6 +31,7 @@ import com.health.openscale.core.data.MeasurementValue
 import com.health.openscale.core.data.User
 import com.health.openscale.core.database.AppDatabase
 import com.health.openscale.core.database.DatabaseRepository
+import com.health.openscale.core.facade.SettingsFacade
 import com.health.openscale.testutil.RoomTestSupport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,6 +60,7 @@ class MeasurementCrudUseCasesTest {
     private lateinit var db: AppDatabase
     private lateinit var repo: DatabaseRepository
     private lateinit var crud: MeasurementCrudUseCases
+    private lateinit var settings: SettingsFacade
     private var userId = 0
     private var weightId = 0
     private var waistId = 0
@@ -67,7 +71,7 @@ class MeasurementCrudUseCasesTest {
         db = RoomTestSupport.inMemory(app)
         repo = RoomTestSupport.repositoryFor(db)
         repo.insertAllMeasurementTypes(MeasurementType.seedRows())
-        val settings = RoomTestSupport.settingsFacadeFor(
+        settings = RoomTestSupport.settingsFacadeFor(
             CoroutineScope(SupervisorJob() + Dispatchers.IO),
             File(app.cacheDir, "crud-${System.nanoTime()}.preferences_pb"),
         )
@@ -99,6 +103,60 @@ class MeasurementCrudUseCasesTest {
         assertThat(id).isGreaterThan(0)
         val values = repo.getValuesForMeasurement(id).first()
         assertThat(values.any { it.typeId == weightId && it.floatValue == 70f }).isTrue()
+    }
+
+    private fun crudWithContext(context: Context): MeasurementCrudUseCases {
+        val sync = SyncUseCases(app, MeasurementTypeCrudUseCases(repo, app))
+        val transformation = MeasurementTransformationUseCase(
+            settings, UserUseCases(app, repo, settings, sync), MeasurementQueryUseCases(repo)
+        )
+        return MeasurementCrudUseCases(context, settings, sync, transformation, repo)
+    }
+
+    @Test
+    fun saveMeasurement_vibrationFailureStillReportsPersistedInsert() = runBlocking {
+        settings.setHapticOnMeasurement(true)
+        var vibrationAttempted = false
+        val context = object : ContextWrapper(app) {
+            override fun getSystemService(name: String): Any? {
+                if (name == Context.VIBRATOR_MANAGER_SERVICE) {
+                    vibrationAttempted = true
+                    throw SecurityException("Test vibration failure")
+                }
+                return super.getSystemService(name)
+            }
+        }
+        val result = crudWithContext(context).saveMeasurement(
+            Measurement(userId = userId, timestamp = 1_000L),
+            listOf(MeasurementValue(measurementId = 0, typeId = weightId, floatValue = 70f)),
+        )
+        val saved = repo.getMeasurementsWithValuesForUser(userId).first().single()
+        assertThat(vibrationAttempted).isTrue()
+        assertThat(saved.values.first { it.type.id == weightId }.value.floatValue).isEqualTo(70f)
+        assertThat(result.getOrNull()).isEqualTo(saved.measurement.id)
+    }
+
+    @Test
+    fun saveMeasurement_imageCleanupFailureStillReportsPersistedUpdate() = runBlocking {
+        val photoType = insertPhotoType()
+        val oldPhoto = createPhoto()
+        val id = saveWithPhoto(photoType.id, oldPhoto)
+        var cleanupAttempted = false
+        val context = object : ContextWrapper(app) {
+            override fun getFilesDir(): File {
+                cleanupAttempted = true
+                throw SecurityException("Test image cleanup failure")
+            }
+        }
+        val result = crudWithContext(context).saveMeasurement(
+            Measurement(id = id, userId = userId, timestamp = 5_000L),
+            listOf(MeasurementValue(measurementId = 0, typeId = weightId, floatValue = 75f)),
+        )
+        val values = repo.getValuesForMeasurement(id).first()
+        assertThat(cleanupAttempted).isTrue()
+        assertThat(values.any { it.typeId == photoType.id }).isFalse()
+        assertThat(values.first { it.typeId == weightId }.floatValue).isEqualTo(75f)
+        assertThat(result.getOrNull()).isEqualTo(id)
     }
 
     @Test
@@ -267,7 +325,7 @@ class MeasurementCrudUseCasesTest {
     @Test
     fun deleteUserAndPurge_deletePhotoFiles() = runBlocking {
         val photoType = insertPhotoType()
-        val settings = RoomTestSupport.settingsFacadeFor(
+        settings = RoomTestSupport.settingsFacadeFor(
             CoroutineScope(SupervisorJob() + Dispatchers.IO),
             File(app.cacheDir, "crud-user-${System.nanoTime()}.preferences_pb"),
         )

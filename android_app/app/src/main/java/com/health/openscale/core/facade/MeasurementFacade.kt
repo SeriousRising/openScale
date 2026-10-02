@@ -243,6 +243,7 @@ class MeasurementFacade @Inject constructor(
 
     /**
      * Persists a measurement received from a scale.
+     * Returns its ID, or null for a duplicate or ignored reading; save failures propagate to the caller.
      *
      * The carry-over runs last, on the measurement whose user is already final (smart assignment may
      * have reassigned it), so the gaps are filled from the history of the user the entry ends up on.
@@ -252,9 +253,9 @@ class MeasurementFacade @Inject constructor(
     suspend fun saveMeasurementFromBleDevice(
         measurement: Measurement,
         values: List<MeasurementValue>,
-    ) {
+    ): Int? {
         val ref = pendingReferenceUser
-        if (ref != null) {
+        val result = if (ref != null) {
             val finalValues = transformation.applyAssistedWeighing(measurement, values, ref)
             crud.saveMeasurement(
                 measurement,
@@ -262,13 +263,13 @@ class MeasurementFacade @Inject constructor(
             )
         } else {
             val finalMeasurement = transformation.applySmartUserAssignment(measurement, values)
-            if (finalMeasurement != null) {
-                crud.saveMeasurement(
-                    finalMeasurement,
-                    transformation.applyValueInheritance(finalMeasurement, values)
-                )
-            }
+                ?: return null
+            crud.saveMeasurement(
+                finalMeasurement,
+                transformation.applyValueInheritance(finalMeasurement, values)
+            )
         }
+        return result.getOrThrow().takeIf { it > 0 }
     }
 
     fun setPendingReferenceUserForBle(referenceUser: User?) {

@@ -940,6 +940,7 @@
     <!-- Adapter: generic errors -->
     <string name="bt_error_no_user_selected">No user selected</string>
     <string name="bt_error_generic">Error</string>
+    <string name="bt_error_operation_failed">The scale could not complete Bluetooth setup or data transfer. Wake the scale and reconnect to try again.</string>
 
     <string name="bt_error_handler_connect_failed">Handler failed on connect: %1$s</string>
     <string name="bt_error_handler_parse_error">Handler parse error for %1$s: %2$s</string>

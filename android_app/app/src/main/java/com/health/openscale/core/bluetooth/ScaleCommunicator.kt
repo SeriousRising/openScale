@@ -44,6 +44,8 @@ sealed class BluetoothEvent {
     data class BroadcastComplete(val deviceAddress: String) : BluetoothEvent()
 
     /** Emitted when a GATT connection has been established. */
+    data class Reconnecting(val deviceAddress: String) : BluetoothEvent()
+
     data class Connected(val deviceName: String, val deviceAddress: String) : BluetoothEvent()
 
     /** Emitted when an existing GATT connection has been disconnected. */

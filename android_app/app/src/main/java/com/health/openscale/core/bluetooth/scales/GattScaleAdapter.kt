@@ -37,11 +37,17 @@ import com.welie.blessed.ConnectionPriority
 import com.welie.blessed.GattStatus
 import com.welie.blessed.HciStatus
 import com.welie.blessed.WriteType
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -60,14 +66,15 @@ class GattScaleAdapter(
     measurementFacade: MeasurementFacade,
     userFacade: UserFacade,
     handler: ScaleDeviceHandler,
-    profile: TuningProfile = TuningProfile.Balanced
-) : ModernScaleAdapter(context, settingsFacade, measurementFacade, userFacade, handler) {
+    profile: TuningProfile = TuningProfile.Balanced,
+    dispatcher: CoroutineDispatcher = Dispatchers.Default
+) : ModernScaleAdapter(context, settingsFacade, measurementFacade, userFacade, handler, dispatcher) {
 
     private val tuning: BleGattTuning = profile.forGatt()
     private lateinit var central: BluetoothCentralManager
     private var currentPeripheral: BluetoothPeripheral? = null
 
-    private val opQueue = Channel<suspend () -> Unit>(Channel.UNLIMITED)
+    private var opQueue = Channel<suspend () -> Unit>(Channel.UNLIMITED)
 
     private data class PendingOp(
         val id: Long,
@@ -77,28 +84,111 @@ class GattScaleAdapter(
     private val deferredMap = ConcurrentHashMap<UUID, PendingOp>()
     private var nextOpId = 0L
 
-    private val ioMutex = Mutex()
-
     private var connectAttempts = 0
+    @Volatile private var connectionWanted = false
+    private var connectionJob: Job? = null
+    private var operationWorker: Job? = null
+    private var handlerJob: Job? = null
 
-    init {
-        // Worker coroutine processes queued BLE operations sequentially
-        scope.launch {
-            for (op in opQueue) {
-                // wait until BLE connection is established
-                while (!_isConnected.value) {
-                    delay(10.milliseconds)
-                }
+    init { startOperationWorker() }
 
+    private fun startOperationWorker(previous: Job? = null) {
+        val queue = opQueue
+        operationWorker = scope.launch {
+            previous?.join()
+            for (op in queue) {
+                while (!_isConnected.value) delay(10.milliseconds)
                 try {
-                    ioMutex.lock()
                     op()
                 } catch (t: Throwable) {
-                    LogManager.e(TAG, "BLE operation failed", t)
-                } finally {
-                    ioMutex.unlock()
+                    if (t is CancellationException && t !is TimeoutCancellationException) throw t
+                    failConnection(t)
                 }
             }
+        }
+    }
+
+    private fun discardOperations() {
+        val previous = operationWorker
+        previous?.cancel()
+        opQueue.cancel()
+        deferredMap.values.forEach { it.deferred.cancel() }
+        deferredMap.clear()
+        opQueue = Channel(Channel.UNLIMITED)
+        startOperationWorker(previous)
+    }
+
+    private fun retryConnection(peripheral: BluetoothPeripheral): Boolean {
+        if (!connectionWanted || measurementPublished || connectAttempts >= tuning.common.maxRetries) return false
+        connectAttempts++
+        _isConnected.value = false
+        _isConnecting.value = true
+        _events.tryEmit(BluetoothEvent.Reconnecting(peripheral.address))
+        _events.tryEmit(BluetoothEvent.DeviceMessage(
+            context.getString(R.string.bt_info_reconnecting_try, connectAttempts, tuning.common.maxRetries),
+            peripheral.address
+        ))
+        connectionJob?.cancel()
+        connectionJob = scope.launch {
+            handlerJob?.join()
+            delay(maxOf(tuning.common.retryBackoffMs, tuning.common.reconnectCooldownMs).milliseconds)
+            if (connectionWanted && !measurementPublished) startScan(peripheral.address)
+        }
+        return true
+    }
+
+    private fun startScan(address: String) {
+        try {
+            central.stopScan()
+            central.scanForPeripheralsWithAddresses(setOf(address))
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            connectionWanted = false
+            _events.tryEmit(BluetoothEvent.ConnectionFailed(address,
+                e.message ?: context.getString(R.string.bt_error_generic)))
+            cleanup()
+        }
+    }
+
+    private fun failConnection(error: Throwable) {
+        if (!connectionWanted) return
+        LogManager.e(TAG, "BLE operation failed", error)
+        doDisconnect()
+        currentPeripheral = null
+        cleanup()
+        _events.tryEmit(BluetoothEvent.ConnectionFailed(targetAddress ?: "unknown",
+            context.getString(R.string.bt_error_operation_failed)))
+    }
+
+    private fun completeOperation(characteristic: UUID, status: GattStatus): Boolean {
+        val pending = deferredMap.remove(characteristic)
+        if (status != GattStatus.SUCCESS) {
+            val error = IllegalStateException("Bluetooth operation on $characteristic failed: $status")
+            pending?.deferred?.completeExceptionally(error)
+            failConnection(error)
+            return false
+        }
+        pending?.deferred?.complete(Unit)
+        return true
+    }
+
+    private fun queueOperation(
+        characteristic: UUID,
+        afterMs: Long,
+        operation: suspend (BluetoothPeripheral) -> Boolean
+    ) {
+        opQueue.trySend {
+            val peripheral = currentPeripheral ?: return@trySend
+            val pending = PendingOp(++nextOpId, CompletableDeferred())
+            deferredMap[characteristic] = pending
+            try {
+                check(operation(peripheral)) { "Could not start Bluetooth operation on $characteristic" }
+                withTimeout(tuning.operationTimeoutMs.milliseconds) { pending.deferred.await() }
+            } finally {
+                deferredMap.remove(characteristic, pending)
+                pending.deferred.cancel()
+            }
+            ioGap(afterMs)
         }
     }
 
@@ -117,59 +207,57 @@ class GattScaleAdapter(
     // -------------------------------------------------------------------------------------------------
     private val centralCallback = object : BluetoothCentralManagerCallback() {
         override fun onDiscovered(peripheral: BluetoothPeripheral, scanResult: ScanResult) {
-            if (peripheral.address != targetAddress) return
+            if (!connectionWanted || peripheral.address != targetAddress || currentPeripheral != null) return
             LogManager.i(TAG, "Found $targetAddress → stop scan + connect")
             central.stopScan()
-            scope.launch {
+            currentPeripheral = peripheral
+            connectionJob?.cancel()
+            connectionJob = scope.launch {
                 if (tuning.connectAfterScanDelayMs > 0) delay(tuning.connectAfterScanDelayMs.milliseconds)
-                central.connect(peripheral, peripheralCallback)
+                if (connectionWanted) central.connect(peripheral, peripheralCallback)
             }
         }
 
         override fun onConnected(peripheral: BluetoothPeripheral) {
-            scope.launch {
-                currentPeripheral = peripheral
-                _isConnected.value = true
-                _isConnecting.value = false
-                _events.tryEmit(BluetoothEvent.Connected(peripheral.name, peripheral.address))
+            if (!connectionWanted || peripheral !== currentPeripheral) {
+                central.cancelConnection(peripheral)
+                return
             }
+            _isConnected.value = true
+            _isConnecting.value = false
+            _events.tryEmit(BluetoothEvent.Connected(peripheral.name, peripheral.address))
         }
 
         override fun onConnectionFailed(peripheral: BluetoothPeripheral, status: HciStatus) {
-            scope.launch {
-                LogManager.e(TAG, "Connection failed ${peripheral.address}: $status")
-                if (connectAttempts < tuning.common.maxRetries) {
-                    val nextTry = connectAttempts + 1
-                    _events.tryEmit(
-                        BluetoothEvent.DeviceMessage(
-                            context.getString(R.string.bt_info_reconnecting_try, nextTry, tuning.common.maxRetries),
-                            peripheral.address
-                        )
-                    )
-                    connectAttempts = nextTry
-                    delay(tuning.common.retryBackoffMs.milliseconds)
-                    runCatching { central.stopScan() }
-                    central.scanForPeripheralsWithAddresses(setOf(peripheral.address))
-                    _isConnecting.value = true
-                } else {
-                    _events.tryEmit(BluetoothEvent.ConnectionFailed(peripheral.address, status.toString()))
-                    cleanup()
-                }
+            if (peripheral !== currentPeripheral || !connectionWanted) return
+            currentPeripheral = null
+            handlerJob?.cancel()
+            discardOperations()
+            if (!retryConnection(peripheral)) {
+                connectionWanted = false
+                _events.tryEmit(BluetoothEvent.ConnectionFailed(peripheral.address, status.toString()))
+                cleanup()
             }
         }
 
         override fun onDisconnected(peripheral: BluetoothPeripheral, status: HciStatus) {
-            scope.launch {
-                LogManager.i(TAG, "Disconnected ${peripheral.address}: $status")
-                runCatching { handler.handleDisconnected() }
-                runCatching { handler.detach() }
-                lastDisconnectAtMs = SystemClock.elapsedRealtime()
-                if (peripheral.address == targetAddress) {
-                    _events.tryEmit(BluetoothEvent.Disconnected(peripheral.address, status.toString()))
-                    cleanup()
-                }
-            }
+            if (peripheral !== currentPeripheral) return
+            LogManager.i(TAG, "Disconnected ${peripheral.address}: $status")
+            val wasConnected = _isConnected.value
+            _isConnected.value = false
+            currentPeripheral = null
+            connectionJob?.cancel()
+            handlerJob?.cancel()
+            discardOperations()
+            runCatching { handler.handleDisconnected() }
+            runCatching { handler.detach() }
+            lastDisconnectAtMs = SystemClock.elapsedRealtime()
+            if (wasConnected && retryConnection(peripheral)) return
+            connectionWanted = false
+            _events.tryEmit(BluetoothEvent.Disconnected(peripheral.address, status.toString()))
+            cleanup()
         }
+
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -177,6 +265,7 @@ class GattScaleAdapter(
     // -------------------------------------------------------------------------------------------------
     private val peripheralCallback = object : BluetoothPeripheralCallback() {
         override fun onServicesDiscovered(peripheral: BluetoothPeripheral) {
+            if (!connectionWanted || peripheral !== currentPeripheral || !_isConnected.value) return
             LogManager.d(TAG, "Services discovered for ${peripheral.address}")
             currentPeripheral = peripheral
 
@@ -184,7 +273,7 @@ class GattScaleAdapter(
             if (tuning.requestMtuBytes > 23) runCatching { peripheral.requestMtu(tuning.requestMtuBytes) }
 
             val user = selectedUserSnapshot ?: run {
-                central.cancelConnection(peripheral); return
+                transport.disconnect(); return
             }
 
             val driverSettings = FacadeDriverSettings(
@@ -193,7 +282,11 @@ class GattScaleAdapter(
                 handlerNamespace = handler::class.simpleName ?: "Handler"
             )
 
-            handler.attach(transport, appCallbacks, driverSettings, dataProvider, scope)
+            if (handlerJob?.isActive == true) return
+            val linkJob = SupervisorJob(scope.coroutineContext[Job])
+            handlerJob = linkJob
+            handler.attach(transport, appCallbacks, driverSettings, dataProvider,
+                CoroutineScope(scope.coroutineContext + linkJob))
             handler.handleConnected(user)
         }
 
@@ -203,12 +296,10 @@ class GattScaleAdapter(
             characteristic: BluetoothGattCharacteristic,
             status: GattStatus
         ) {
+            if (!connectionWanted || peripheral !== currentPeripheral || !_isConnected.value) return
             LogManager.d(TAG,"\u2190 write response chr=${characteristic.uuid} len=${value.size} status=${status} ${value.toHexPreview(24)}")
 
-            deferredMap[characteristic.uuid]?.let { op ->
-                op.deferred.complete(Unit)
-                deferredMap.remove(characteristic.uuid)
-            }
+            completeOperation(characteristic.uuid, status)
         }
 
         override fun onNotificationStateUpdate(
@@ -216,12 +307,10 @@ class GattScaleAdapter(
             characteristic: BluetoothGattCharacteristic,
             status: GattStatus
         ) {
+            if (!connectionWanted || peripheral !== currentPeripheral || !_isConnected.value) return
             LogManager.d(TAG,"\u2190 notify state chr=${characteristic.uuid} status=${status}")
 
-            deferredMap[characteristic.uuid]?.let { op ->
-                op.deferred.complete(Unit)
-                deferredMap.remove(characteristic.uuid)
-            }
+            completeOperation(characteristic.uuid, status)
         }
 
         override fun onCharacteristicUpdate(
@@ -230,13 +319,11 @@ class GattScaleAdapter(
             characteristic: BluetoothGattCharacteristic,
             status: GattStatus
         ) {
+            if (!connectionWanted || peripheral !== currentPeripheral || !_isConnected.value) return
             LogManager.d(TAG,"\u2190 received data chr=${characteristic.uuid} len=${value.size} status=${status} ${value.toHexPreview(24)}")
 
-            handler.handleNotification(characteristic.uuid, value)
-
-            deferredMap[characteristic.uuid]?.let { op ->
-                op.deferred.complete(Unit)
-                deferredMap.remove(characteristic.uuid)
+            if (completeOperation(characteristic.uuid, status)) {
+                handler.handleNotification(characteristic.uuid, value)
             }
         }
     }
@@ -247,126 +334,39 @@ class GattScaleAdapter(
     private val transport = object : ScaleDeviceHandler.Transport {
 
         override fun setNotifyOn(service: UUID, characteristic: UUID) {
-            opQueue.trySend {
-                val p = currentPeripheral ?: return@trySend
+            queueOperation(characteristic, tuning.notifySetupDelayMs) { p ->
                 LogManager.d(TAG, "→ set notify on chr=$characteristic svc=$service")
-
-                val opId = ++nextOpId
-                val deferred = CompletableDeferred<Unit>()
-                deferredMap[characteristic] = PendingOp(opId, deferred)
-
-                val started = p.startNotify(service, characteristic)
-                if (!started) {
-                    LogManager.w(TAG, "Failed to initiate notify for $characteristic")
-                   // appCallbacks.onWarn(R.string.bt_warn_notify_failed, characteristic.toString())
-                    deferred.complete(Unit)
-                    deferredMap.remove(characteristic)
-                }
-
-                try {
-                    // Wait with timeout from tuning
-                    withTimeout(tuning.operationTimeoutMs.milliseconds) {
-                        deferred.await()
-                    }
-                } catch (_: Exception) {
-                    LogManager.w(TAG, "Timeout waiting for notify on $characteristic")
-                } finally {
-                    val current = deferredMap[characteristic]
-                    if (current?.id == opId) {
-                        deferredMap.remove(characteristic)
-                    }
-                    deferred.cancel()
-                }
-
-                ioGap(tuning.notifySetupDelayMs)
+                p.startNotify(service, characteristic)
             }
         }
 
         override fun write(service: UUID, characteristic: UUID, payload: ByteArray, withResponse: Boolean) {
-            opQueue.trySend {
-                val p = currentPeripheral ?: return@trySend
-                val ch = p.getCharacteristic(service, characteristic) ?: return@trySend
-
-                val opId = ++nextOpId
-                val deferred = CompletableDeferred<Unit>()
-                deferredMap[characteristic] = PendingOp(opId, deferred)
-
+            queueOperation(characteristic, tuning.postWriteDelayMs) { p ->
+                val ch = p.getCharacteristic(service, characteristic) ?: return@queueOperation false
                 val supportsWriteNoResponse = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
                 val supportsWriteResponse = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
-
                 val type = when {
                     withResponse && supportsWriteResponse -> WriteType.WITH_RESPONSE
                     !withResponse && supportsWriteNoResponse -> WriteType.WITHOUT_RESPONSE
-                    supportsWriteResponse -> {
-                        LogManager.w(TAG, "Characteristic $characteristic does not support WITHOUT_RESPONSE, using WITH_RESPONSE instead")
-                        WriteType.WITH_RESPONSE
-                    }
-                    supportsWriteNoResponse -> {
-                        LogManager.w(TAG, "Characteristic $characteristic does not support WITH_RESPONSE, using WITHOUT_RESPONSE instead")
-                        WriteType.WITHOUT_RESPONSE
-                    }
-                    else -> {
-                        LogManager.w(TAG, "Characteristic $characteristic does not support writing")
-                        return@trySend
-                    }
+                    supportsWriteResponse -> WriteType.WITH_RESPONSE
+                    supportsWriteNoResponse -> WriteType.WITHOUT_RESPONSE
+                    else -> return@queueOperation false
                 }
-
                 ioGap(if (withResponse) tuning.writeWithResponseDelayMs else tuning.writeWithoutResponseDelayMs)
+                LogManager.d(TAG, "→ write to chr=$characteristic svc=$service len=${payload.size} type=$type")
                 p.writeCharacteristic(service, characteristic, payload, type)
-
-                LogManager.d(TAG,"\u2192 write to chr=$characteristic svc=$service len=${payload.size} withResp=$withResponse ${payload.toHexPreview(24)}")
-
-                try {
-                    withTimeout(tuning.operationTimeoutMs.milliseconds) {
-                        deferred.await()
-                    }
-                } catch (_: Throwable) {
-                    LogManager.w(TAG, "Timeout waiting for write on $characteristic")
-                } finally {
-                    val current = deferredMap[characteristic]
-                    if (current?.id == opId) {
-                        deferredMap.remove(characteristic)
-                    }
-                    deferred.cancel()
-                }
-
-                ioGap(tuning.postWriteDelayMs)
             }
         }
 
         override fun read(service: UUID, characteristic: UUID) {
-            opQueue.trySend {
-                val p = currentPeripheral ?: return@trySend
-                p.getCharacteristic(service, characteristic) ?: return@trySend
-
-                val opId = ++nextOpId
-                val deferred = CompletableDeferred<Unit>()
-                deferredMap[characteristic] = PendingOp(opId, deferred)
-
+            queueOperation(characteristic, tuning.postReadDelayMs) { p ->
+                LogManager.d(TAG, "→ read from chr=$characteristic svc=$service")
                 p.readCharacteristic(service, characteristic)
-
-                LogManager.d(TAG,"\u2192 read from chr=$characteristic svc=$service")
-
-                try {
-                    withTimeout(tuning.operationTimeoutMs.milliseconds) {
-                        deferred.await()
-                    }
-                } catch (_: Throwable) {
-                    LogManager.w(TAG, "Timeout waiting for read on $characteristic")
-                } finally {
-                    val current = deferredMap[characteristic]
-                    if (current?.id == opId) {
-                        deferredMap.remove(characteristic)
-                    }
-                    deferred.cancel()
-                }
-
-                ioGap(tuning.postReadDelayMs)
             }
         }
 
         override fun disconnect() {
-            currentPeripheral?.let { central.cancelConnection(it) }
+            doDisconnect()
         }
 
         override fun getPeripheral(): BluetoothPeripheral? = currentPeripheral
@@ -394,30 +394,27 @@ class GattScaleAdapter(
 
         runCatching { central.stopScan() }
 
-        scope.launch {
+        connectionWanted = true
+        connectionJob?.cancel()
+        connectionJob = scope.launch {
             if (waitMs > 0) delay(waitMs.milliseconds)
-            try {
-                central.scanForPeripheralsWithAddresses(setOf(address))
-            } catch (e: Exception) {
-                LogManager.e(TAG, "Failed to start scan/connect: ${e.message}", e)
-                _events.tryEmit(
-                    BluetoothEvent.ConnectionFailed(
-                        address,
-                        e.message ?: context.getString(R.string.bt_error_generic)
-                    )
-                )
-                cleanup()
-            }
+            if (connectionWanted) startScan(address)
         }
     }
 
     override fun doDisconnect() {
+        connectionWanted = false
+        handlerJob?.cancel()
+        connectionJob?.cancel()
+        discardOperations()
         runCatching { if (::central.isInitialized) central.stopScan() }
         currentPeripheral?.let { runCatching { central.cancelConnection(it) } }
-        currentPeripheral = null
     }
 
     override fun close() {
+        doDisconnect()
+        cleanup()
+        currentPeripheral = null
         // Stop accepting new BLE operations and release the Blessed central
         // (its broadcast receivers) before the base cancels the coroutine scope,
         // which terminates the busy-waiting op-queue worker.

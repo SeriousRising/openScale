@@ -1,0 +1,13 @@
+{
+  "commit": "9fea9c813de282a0c3ab54bca923e62ee2d0362e",
+  "command": "./gradlew testDebugUnitTest lintDebug",
+  "jdk": "21.0.12.1+1",
+  "result": "PASS",
+  "suites": 93,
+  "tests": 878,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "lint": "PASS",
+  "missed_reading_reproduced": false
+}

@@ -19,11 +19,14 @@ package com.health.openscale.ui.screen.settings
 
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.runtime.Composable
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
 import com.health.openscale.R
 import com.health.openscale.core.bluetooth.BluetoothEvent
 import com.health.openscale.core.bluetooth.scales.TuningProfile
+import com.health.openscale.core.data.ConnectionStatus
 import com.health.openscale.core.facade.BluetoothFacade
 import com.health.openscale.core.facade.SettingsFacade
 import com.health.openscale.core.service.ScannedDeviceInfo
@@ -35,7 +38,6 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
 /**
@@ -104,20 +106,21 @@ class BluetoothViewModel @Inject constructor(
                 _snackbarEvents.emit(evt)
             }
         }
+    }
 
-        // Auto-connect on startup
-        viewModelScope.launch {
-            val enabled = settingsFacade.autoConnectOnStartup.first()
-            if (!enabled) return@launch
+    suspend fun observeForegroundAutoConnect(lifecycle: Lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            if (!settingsFacade.autoConnectOnStartup.first()) return@repeatOnLifecycle
 
-            val device = withTimeoutOrNull(1_500) {
-                bt.savedDevice
-                    .filter { it != null }
-                    .first()
-            }
-
-            if (device != null) {
-                bt.attemptAutoConnectToSavedDevice()
+            // Subscribe to load the saved device; leaving the foreground cancels this wait.
+            bt.savedDevice.filter { it != null }.first()
+            if (!settingsFacade.autoConnectOnStartup.first()) return@repeatOnLifecycle
+            when (bt.connectionStatus.value) {
+                ConnectionStatus.CONNECTED,
+                ConnectionStatus.CONNECTING,
+                ConnectionStatus.DISCONNECTING,
+                ConnectionStatus.BROADCAST_LISTENING -> return@repeatOnLifecycle
+                else -> bt.attemptAutoConnectToSavedDevice()
             }
         }
     }
